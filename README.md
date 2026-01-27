@@ -15,6 +15,7 @@ How to make the GUI work on Windows:
       - pip install -r requirements.txt
       - python gui_glycogen_segmenter_v996.py
 7) The GUI should open in your web browser
+
 Note: The model was trained only on myofibrillar images. However, it can also predict subsarcolemmal glycogen (classified as intermyofibrillar) when applied to           subsarcolemmal images. The model can additionally predict mitochondria and Z-disc width, which may be used as fibre type indicators.
 
 How the model was trained:
