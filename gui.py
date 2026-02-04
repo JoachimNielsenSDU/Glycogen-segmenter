@@ -61,9 +61,9 @@ def resize_with_snap(img: np.ndarray, scale: float = 1.0, mult: int = 16) -> np.
 def main():
     parser = argparse.ArgumentParser(description='Open GUI to run inference')
     parser.add_argument('--glycogen_model', type=str, help='Path to model weights',
-                        default='weights_glycogen/glycogen_model.pth')
+                        default='weights/glycogen_model.pth')
     parser.add_argument('--region_model', type=str, help='Path to model weights',
-                        default='weights_region/region_model.pth')
+                        default='weights/region_model.pth')
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
