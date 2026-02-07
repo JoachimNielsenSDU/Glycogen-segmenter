@@ -508,7 +508,7 @@ def main():
                     with gr.Row():
                         scale_b = gr.Number(value=1.0, precision=6, label="Scale (pixel multiplier) (batch)")
                         snap_multiple_b = gr.Dropdown(choices=[32, 64, 128], value=128, label="Snap to multiple (batch)")
-                        gr.Markdown("Tip: set scale = input_nm_per_px / target_nm_per_px. E.g., x33000 (CFIM): 1.53 / 0.7698 ≈ 2")
+                        gr.Markdown("Tip: set scale = input_nm_per_px / model_nm_per_px. E.g., 1.53 / 0.7698 ≈ 2")
 
                     with gr.Row():
                         run_batch_button = gr.Button("Run")
@@ -531,7 +531,7 @@ def main():
                     with gr.Row():
                         scale_s = gr.Number(value=1.0, precision=6, label="Scale (pixel multiplier)")
                         snap_multiple_s = gr.Dropdown(choices=[32, 64, 128], value=128, label="Snap to multiple")
-                        gr.Markdown("Tip: set scale = input_nm_per_px / target_nm_per_px. E.g., x33000 (CFIM): 1.53 / 0.7698 ≈ 2")
+                        gr.Markdown("Tip: set scale = input_nm_per_px / model_nm_per_px. E.g., 1.53 / 0.7698 ≈ 2")
 
 
                     with gr.Row():
@@ -556,3 +556,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
