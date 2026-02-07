@@ -7,9 +7,9 @@ A deep learning model for automatically predicting glycogen within distinct subc
 This repository contains a U-Net based segmentation model trained to identify subcellular regions and quantify glycogen distribution in skeletal muscle TEM images. The model combines two separate neural networks: one for predicting subcellular regions (A-band, I-band, intermyofibrillar, mitochondria, and Z-disc) and another for glycogen detection.
 
 The model is described in this paper: 
-**A semantic segmentation model to predict subcellular glycogen localization using transmission electron microscopy images**
+**A semantic segmentation model to predict subcellular glycogen localization using transmission electron microscopy images.**
 Anders Aagaard Hansen, Jacob Marcus Egebjerg, Kristian Solem, Kristoffer Jensen Kolnes, Daniel Wüstner, Jørgen F. P. Wojtaszewski, Jørgen Jensen, and Joachim Nielsen
-bioRxiv 2026.02.04.703703; doi: https://doi.org/10.64898/2026.02.04.703703
+*bioRxiv* 2026.02.04.703703; doi: https://doi.org/10.64898/2026.02.04.703703
 
 The raw images, annotated masks, and pre-trained model weights are available at: https://zenodo.org/uploads/18390286 (DOI: 10.5281/zenodo.18390286)
 
