@@ -1284,6 +1284,176 @@ def train_region_model_from_scratch(images_dir, labels_dir, output_dir, model_na
         return error_msg
 
 
+def _normalize_imf_region_name(region):
+    return "".join(ch.lower() for ch in str(region) if ch.isalnum())
+
+
+def _safe_div(numerator, denominator):
+    if denominator == 0 or not np.isfinite(denominator):
+        return np.nan
+    return numerator / denominator
+
+
+def _compute_imf_region_set(glycogen_area, mean_feret_diameter, total_area, thickness_um,
+                            aa_slope=None, aa_intercept=None, pixel_size_nm=0.7698):
+    aa = _safe_div(glycogen_area, total_area)
+    if (
+        np.isfinite(aa)
+        and aa_slope is not None
+        and aa_intercept is not None
+        and np.isfinite(aa_slope)
+        and np.isfinite(aa_intercept)
+    ):
+        aa = aa - ((aa_slope * aa) + aa_intercept)
+
+    h = (mean_feret_diameter * pixel_size_nm) / 1000.0
+    s = np.pi * (h ** 2)
+    na = _safe_div(aa, np.pi * ((0.5 * h) ** 2))
+    nv = _safe_div(na, thickness_um + h)
+    sv = nv * s if np.isfinite(nv) and np.isfinite(s) else np.nan
+
+    ba = np.nan
+    if np.isfinite(sv) and np.isfinite(nv) and np.isfinite(h):
+        ba = ((np.pi * sv) / 4.0) + (thickness_um * nv * np.pi * h)
+
+    vv = np.nan
+    if np.isfinite(aa) and np.isfinite(ba) and np.isfinite(na) and np.isfinite(h):
+        vv = 100.0 * (
+            aa - (thickness_um * ((ba / np.pi) - (_safe_div(na * thickness_um * h, (thickness_um + h)))))
+        )
+
+    numerical_density = np.nan
+    if np.isfinite(vv) and np.isfinite(h):
+        numerical_density = _safe_div(vv / 100, (3.0 / 4.0) * np.pi * ((h / 2.0) ** 3))
+
+    return {
+        "aa": aa,
+        "h": h,
+        "s": s,
+        "na": na,
+        "nv": nv,
+        "sv": sv,
+        "ba": ba,
+        "vv_pct": vv,
+        "numerical_density": numerical_density,
+    }
+
+
+def compute_imf_stereology_metrics(input_csv_path, output_xlsx_path,
+                                   pixel_size_nm, thickness_um,
+                                   imf_aa_slope, imf_aa_intercept,
+                                   intra_aa_slope, intra_aa_intercept):
+    df = pd.read_csv(input_csv_path)
+    required_cols = {
+        "Subfolder",
+        "Image",
+        "Region",
+        "Area",
+        "Glycogen Area",
+        "Mean Feret Diameter",
+        "Z-disc max feret",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    numeric_cols = ["Area", "Glycogen Area", "Mean Feret Diameter", "Z-disc max feret"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["_region"] = df["Region"].map(_normalize_imf_region_name)
+    wanted_regions = ["intermyofibrillar", "mitochondria", "zdisc", "intra"]
+
+    rows = []
+    for (subfolder, image), grp in df.groupby(["Subfolder", "Image"], sort=True):
+        region_map = {
+            region: grp.loc[grp["_region"] == region].iloc[0]
+            for region in wanted_regions
+            if not grp.loc[grp["_region"] == region].empty
+        }
+
+        total_area = float(
+            sum(float(region_map[r]["Area"]) for r in wanted_regions if r in region_map)
+        )
+
+        out_row = {
+            "Subfolder": subfolder,
+            "Image": image,
+            "sum_area_imf_mito_zdisc_intra": total_area,
+        }
+
+        if "intermyofibrillar" in region_map:
+            imf = _compute_imf_region_set(
+                glycogen_area=float(region_map["intermyofibrillar"]["Glycogen Area"]),
+                mean_feret_diameter=float(region_map["intermyofibrillar"]["Mean Feret Diameter"]),
+                total_area=total_area,
+                thickness_um=float(thickness_um),
+                aa_slope=float(imf_aa_slope),
+                aa_intercept=float(imf_aa_intercept),
+                pixel_size_nm=float(pixel_size_nm),
+            )
+            out_row.update({f"IMF_{k}": v for k, v in imf.items()})
+        else:
+            out_row.update({f"IMF_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
+
+        if "intra" in region_map:
+            intra = _compute_imf_region_set(
+                glycogen_area=float(region_map["intra"]["Glycogen Area"]),
+                mean_feret_diameter=float(region_map["intra"]["Mean Feret Diameter"]),
+                total_area=total_area,
+                thickness_um=float(thickness_um),
+                aa_slope=float(intra_aa_slope),
+                aa_intercept=float(intra_aa_intercept),
+                pixel_size_nm=float(pixel_size_nm),
+            )
+            out_row.update({f"intra_{k}": v for k, v in intra.items()})
+        else:
+            out_row.update({f"intra_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
+
+        intra_area = float(region_map["intra"]["Area"]) if "intra" in region_map else np.nan
+        zdisc_area = float(region_map["zdisc"]["Area"]) if "zdisc" in region_map else np.nan
+        out_row["intra_zdisc_area_per_total_area"] = _safe_div(
+            sum(area for area in [intra_area, zdisc_area] if np.isfinite(area)),
+            total_area,
+        )
+        out_row["intra_vv_pct_per_intra_zdisc_area"] = _safe_div(
+            out_row.get("intra_vv_pct", np.nan),
+            out_row["intra_zdisc_area_per_total_area"],
+        )
+
+        mito_area = float(region_map["mitochondria"]["Area"]) if "mitochondria" in region_map else np.nan
+        out_row["mito_vv_pct"] = 100.0 * _safe_div(mito_area, total_area)
+
+        if "zdisc" in region_map:
+            zdisc_max_feret = float(region_map["zdisc"]["Z-disc max feret"])
+            out_row["zdiscwidth"] = _safe_div(zdisc_area, zdisc_max_feret) * float(pixel_size_nm)
+        else:
+            out_row["zdiscwidth"] = np.nan
+
+        rows.append(out_row)
+
+    out_df = pd.DataFrame(rows)
+    out_df = out_df.sort_values(["Subfolder", "Image"]).reset_index(drop=True)
+
+    output_path = (output_xlsx_path or "").strip()
+    if not output_path:
+        input_stem = os.path.splitext(os.path.abspath(input_csv_path))[0]
+        output_path = f"{input_stem}_stereology.xlsx"
+
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        out_df.to_excel(output_path, index=False)
+    except PermissionError:
+        alt_output_path = os.path.splitext(output_path)[0] + "_v2.xlsx"
+        out_df.to_excel(alt_output_path, index=False)
+        output_path = alt_output_path
+
+    return out_df, output_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='Open GUI to run inference')
     parser.add_argument('--glycogen_model', type=str, help='Path to model weights',
@@ -2360,6 +2530,39 @@ def main():
         img = tifffile.imread(file.name)
         return img
 
+    def resolve_uploaded_or_text_path(uploaded_file, path_text):
+        if uploaded_file is not None:
+            return uploaded_file.name
+        return (path_text or "").strip()
+
+    def run_imf_metrics(csv_file, csv_path_text, output_xlsx_path,
+                        pixel_size_nm, thickness_um,
+                        imf_aa_slope, imf_aa_intercept,
+                        intra_aa_slope, intra_aa_intercept):
+        input_csv_path = resolve_uploaded_or_text_path(csv_file, csv_path_text)
+        if not input_csv_path:
+            raise gr.Error("Select a batch CSV file or provide its path.")
+        if not os.path.exists(input_csv_path):
+            raise gr.Error(f"CSV file not found: {input_csv_path}")
+
+        metrics_df, saved_path = compute_imf_stereology_metrics(
+            input_csv_path=input_csv_path,
+            output_xlsx_path=output_xlsx_path,
+            pixel_size_nm=float(pixel_size_nm),
+            thickness_um=float(thickness_um),
+            imf_aa_slope=float(imf_aa_slope),
+            imf_aa_intercept=float(imf_aa_intercept),
+            intra_aa_slope=float(intra_aa_slope),
+            intra_aa_intercept=float(intra_aa_intercept),
+        )
+
+        status = (
+            f"Loaded CSV: {input_csv_path}\n"
+            f"Rows computed: {len(metrics_df)}\n"
+            f"Saved workbook: {saved_path}"
+        )
+        return metrics_df, status, saved_path
+
     # Create the GUI
     with gr.Blocks() as gui:
         # Main layout
@@ -2456,6 +2659,91 @@ def main():
                                 region_scale_value_b, region_scale_mode_b,
                                 snap_multiple_b, glycogen_model_batch, region_model_batch],
                         outputs=[progress_bar]
+                    )
+
+                with gr.Tab("IMF metrics"):
+                    gr.Markdown("Compute IMF and intra stereology metrics from a batch CSV exported by the Batch processing tab.")
+
+                    with gr.Row():
+                        batch_csv_file = gr.File(
+                            label="Batch CSV File (.csv)",
+                            file_types=[".csv"]
+                        )
+                        batch_csv_path = gr.Textbox(
+                            label="Or CSV Path",
+                            placeholder="Full path to glycogen_distribution_combined_threshold_*.csv"
+                        )
+
+                    output_xlsx_path = gr.Textbox(
+                        label="Output Workbook Path",
+                        placeholder="If blank, saves next to the CSV as *_stereology.xlsx"
+                    )
+
+                    with gr.Row():
+                        pixel_size_nm_imf = gr.Number(
+                            label="Pixel Size (nm)",
+                            value=0.7698,
+                            precision=4
+                        )
+                        thickness_um_imf = gr.Number(
+                            label="Section Thickness (um)",
+                            value=0.06,
+                            precision=4
+                        )
+
+                    with gr.Row():
+                        imf_aa_slope = gr.Number(
+                            label="IMF AA Correction Slope",
+                            value=-0.1767,
+                            precision=6
+                        )
+                        imf_aa_intercept = gr.Number(
+                            label="IMF AA Correction Intercept",
+                            value=0.00299,
+                            precision=6
+                        )
+
+                    with gr.Row():
+                        intra_aa_slope = gr.Number(
+                            label="Intra AA Correction Slope",
+                            value=-0.1561,
+                            precision=6
+                        )
+                        intra_aa_intercept = gr.Number(
+                            label="Intra AA Correction Intercept",
+                            value=0.001728,
+                            precision=6
+                        )
+
+                    gr.Markdown("The CSV must contain Subfolder, Image, Region, Area, Glycogen Area, Mean Feret Diameter, and Z-disc max feret columns.")
+
+                    run_imf_metrics_button = gr.Button("Compute IMF Metrics", variant="primary")
+
+                    imf_metrics_output = gr.DataFrame(
+                        label="Computed IMF Metrics",
+                        interactive=False
+                    )
+
+                    imf_metrics_status = gr.Textbox(
+                        label="Status",
+                        lines=4,
+                        interactive=False
+                    )
+
+                    run_imf_metrics_button.click(
+                        run_imf_metrics,
+                        inputs=[
+                            batch_csv_file,
+                            batch_csv_path,
+                            output_xlsx_path,
+                            pixel_size_nm_imf,
+                            thickness_um_imf,
+                            imf_aa_slope,
+                            imf_aa_intercept,
+                            intra_aa_slope,
+                            intra_aa_intercept,
+                        ],
+                        outputs=[imf_metrics_output, imf_metrics_status, output_xlsx_path]
                     )
 
                 with gr.Tab("Single image"):
