@@ -1,5 +1,6 @@
 import os
 import argparse
+import re
 
 # Work around mixed OpenMP runtimes (libomp/libiomp) on some Windows Conda setups.
 if os.name == "nt":
@@ -1288,6 +1289,62 @@ def _normalize_imf_region_name(region):
     return "".join(ch.lower() for ch in str(region) if ch.isalnum())
 
 
+def _canonical_image_value(image_value):
+    if pd.isna(image_value):
+        return ""
+    return str(image_value).strip()
+
+
+def _image_sort_key(image_value):
+    text = _canonical_image_value(image_value)
+    try:
+        return (0, float(text), text)
+    except (TypeError, ValueError):
+        pass
+
+    nums = re.findall(r"\d+", text)
+    if nums:
+        return (1, tuple(int(n) for n in nums), text.lower())
+
+    return (2, text.lower())
+
+
+def _build_image_location_map(df):
+    location_map = {}
+    for subfolder, grp in df.groupby("Subfolder", sort=False):
+        image_values = sorted(grp["Image"].tolist(), key=_image_sort_key)
+        unique_images = []
+        seen = set()
+        for image_value in image_values:
+            key = _canonical_image_value(image_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_images.append(key)
+
+        n = len(unique_images)
+        if n == 0:
+            continue
+
+        superficial = set(unique_images[:min(6, n)])
+        central = set(unique_images[max(0, n - 6):])
+
+        for image_key in unique_images:
+            is_central = image_key in central
+            is_superficial = image_key in superficial
+            if is_central and is_superficial:
+                location = "central/superficial"
+            elif is_central:
+                location = "central"
+            elif is_superficial:
+                location = "superficial"
+            else:
+                location = ""
+            location_map[(subfolder, image_key)] = location
+
+    return location_map
+
+
 def _safe_div(numerator, denominator):
     if denominator == 0 or not np.isfinite(denominator):
         return np.nan
@@ -1295,7 +1352,14 @@ def _safe_div(numerator, denominator):
 
 
 def _compute_imf_region_set(glycogen_area, mean_feret_diameter, total_area, thickness_um,
-                            aa_slope=None, aa_intercept=None, pixel_size_nm=0.7698):
+                            aa_slope=None, aa_intercept=None, pixel_size_nm=0.7698,
+                            mean_particle_area=None, diameter_method="feret"):
+    """
+    Compute IMF/intra stereology metrics.
+    
+    diameter_method: "feret" (default) uses mean_feret_diameter, 
+                    "area_circle" uses particle_area assuming circular profiles
+    """
     aa = _safe_div(glycogen_area, total_area)
     if (
         np.isfinite(aa)
@@ -1306,7 +1370,17 @@ def _compute_imf_region_set(glycogen_area, mean_feret_diameter, total_area, thic
     ):
         aa = aa - ((aa_slope * aa) + aa_intercept)
 
-    h = (mean_feret_diameter * pixel_size_nm) / 1000.0
+    # Compute particle diameter based on selected method
+    if diameter_method == "area_circle" and mean_particle_area is not None and np.isfinite(mean_particle_area):
+        # Compute diameter from area assuming circular profile
+        # For a circle: A = π * (d/2)² => d = 2 * sqrt(A / π)
+        # Convert from pixels to micrometers (1 um = 1000 nm)
+        diameter_um = 2.0 * np.sqrt(mean_particle_area / np.pi) * pixel_size_nm / 1000.0
+        h = diameter_um
+    else:
+        # Default: use mean feret diameter
+        h = (mean_feret_diameter * pixel_size_nm) / 1000.0
+    
     s = np.pi * (h ** 2)
     na = _safe_div(aa, np.pi * ((0.5 * h) ** 2))
     nv = _safe_div(na, thickness_um + h)
@@ -1339,10 +1413,233 @@ def _compute_imf_region_set(glycogen_area, mean_feret_diameter, total_area, thic
     }
 
 
+def _build_imf_output_row(subfolder, image_value, region_map, total_area, pixel_size_nm, thickness_um,
+                          imf_aa_slope, imf_aa_intercept, intra_aa_slope, intra_aa_intercept,
+                          include_image_location=False, image_location="", diameter_method="feret"):
+    out_row = {
+        "Subfolder": subfolder,
+        "Image": image_value,
+        "sum_area_imf_mito_zdisc_intra": total_area,
+    }
+    if include_image_location:
+        out_row["Image Location"] = image_location
+
+    if "intermyofibrillar" in region_map:
+        imf_mean_particle_area = float(region_map["intermyofibrillar"].get("Mean Particle Area", np.nan))
+        imf = _compute_imf_region_set(
+            glycogen_area=float(region_map["intermyofibrillar"]["Glycogen Area"]),
+            mean_feret_diameter=float(region_map["intermyofibrillar"]["Mean Feret Diameter"]),
+            total_area=total_area,
+            thickness_um=float(thickness_um),
+            aa_slope=float(imf_aa_slope),
+            aa_intercept=float(imf_aa_intercept),
+            pixel_size_nm=float(pixel_size_nm),
+            mean_particle_area=imf_mean_particle_area,
+            diameter_method=diameter_method,
+        )
+        out_row.update({f"IMF_{k}": v for k, v in imf.items()})
+    else:
+        out_row.update({f"IMF_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
+
+    if "intra" in region_map:
+        intra_mean_particle_area = float(region_map["intra"].get("Mean Particle Area", np.nan))
+        intra = _compute_imf_region_set(
+            glycogen_area=float(region_map["intra"]["Glycogen Area"]),
+            mean_feret_diameter=float(region_map["intra"]["Mean Feret Diameter"]),
+            total_area=total_area,
+            thickness_um=float(thickness_um),
+            aa_slope=float(intra_aa_slope),
+            aa_intercept=float(intra_aa_intercept),
+            pixel_size_nm=float(pixel_size_nm),
+            mean_particle_area=intra_mean_particle_area,
+            diameter_method=diameter_method,
+        )
+        out_row.update({f"intra_{k}": v for k, v in intra.items()})
+    else:
+        out_row.update({f"intra_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
+
+    intra_area = float(region_map["intra"]["Area"]) if "intra" in region_map else np.nan
+    zdisc_area = float(region_map["zdisc"]["Area"]) if "zdisc" in region_map else np.nan
+    out_row["intra_zdisc_area_per_total_area"] = _safe_div(
+        sum(area for area in [intra_area, zdisc_area] if np.isfinite(area)),
+        total_area,
+    )
+    out_row["intra_vv_pct_per_intra_zdisc_area"] = _safe_div(
+        out_row.get("intra_vv_pct", np.nan),
+        out_row["intra_zdisc_area_per_total_area"],
+    )
+
+    mito_area = float(region_map["mitochondria"]["Area"]) if "mitochondria" in region_map else np.nan
+    out_row["mito_vv_pct"] = 100.0 * _safe_div(mito_area, total_area)
+
+    if "zdisc" in region_map:
+        zdisc_max_feret = float(region_map["zdisc"]["Z-disc max feret"])
+        out_row["zdiscwidth"] = _safe_div(zdisc_area, zdisc_max_feret) * float(pixel_size_nm)
+    else:
+        out_row["zdiscwidth"] = np.nan
+
+    return out_row
+
+
+def _weighted_mean(values, weights):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    valid_mask = np.isfinite(values) & np.isfinite(weights)
+    if not np.any(valid_mask):
+        return np.nan
+    return float(np.average(values[valid_mask], weights=weights[valid_mask]))
+
+
+def _compute_subfolder_outputs_from_raw_inputs(raw_df, pixel_size_nm, thickness_um,
+                                               imf_aa_slope, imf_aa_intercept,
+                                               intra_aa_slope, intra_aa_intercept,
+                                               include_image_location=False,
+                                               use_weighted_ratio=False,
+                                               weight_ratio=3.0,
+                                               diameter_method="feret"):
+    if raw_df.empty or "Subfolder" not in raw_df.columns:
+        return pd.DataFrame()
+
+    if use_weighted_ratio and not include_image_location:
+        raise ValueError("Weighted subfolder averaging requires Image Location data.")
+
+    if "_region" not in raw_df.columns:
+        working_df = raw_df.copy()
+        working_df["_region"] = working_df["Region"].map(_normalize_imf_region_name)
+    else:
+        working_df = raw_df
+
+    if include_image_location:
+        image_location_map = _build_image_location_map(working_df)
+    else:
+        image_location_map = {}
+
+    wanted_regions = ["intermyofibrillar", "mitochondria", "zdisc", "intra"]
+    numeric_input_cols = ["Area", "Glycogen Area", "Mean Feret Diameter", "Z-disc max feret"]
+    if "Mean Particle Area" in working_df.columns:
+        numeric_input_cols.append("Mean Particle Area")
+
+    rows = []
+    for subfolder, subgrp in working_df.groupby("Subfolder", sort=False):
+        region_map = {}
+        for region in wanted_regions:
+            region_rows = subgrp.loc[subgrp["_region"] == region].copy()
+            if region_rows.empty:
+                continue
+
+            if use_weighted_ratio:
+                weights = [
+                    float(weight_ratio)
+                    if "superficial" in str(image_location_map.get((subfolder, _canonical_image_value(image)), "")).lower()
+                    else 1.0
+                    for image in region_rows["Image"]
+                ]
+            else:
+                weights = np.ones(len(region_rows), dtype=float)
+
+            region_data = {}
+            for col in numeric_input_cols:
+                if col in region_rows.columns:
+                    region_data[col] = _weighted_mean(region_rows[col].to_numpy(), weights)
+
+            if region_data:
+                region_map[region] = pd.Series(region_data)
+
+        total_area = float(
+            sum(float(region_map[r]["Area"]) for r in wanted_regions if r in region_map)
+        )
+
+        if include_image_location:
+            image_location = "subfolder-level (from raw inputs)"
+        else:
+            image_location = ""
+
+        rows.append(
+            _build_imf_output_row(
+                subfolder=subfolder,
+                image_value="subfolder-avg (raw inputs)",
+                region_map=region_map,
+                total_area=total_area,
+                pixel_size_nm=pixel_size_nm,
+                thickness_um=thickness_um,
+                imf_aa_slope=imf_aa_slope,
+                imf_aa_intercept=imf_aa_intercept,
+                intra_aa_slope=intra_aa_slope,
+                intra_aa_intercept=intra_aa_intercept,
+                include_image_location=include_image_location,
+                image_location=image_location,
+                diameter_method=diameter_method,
+            )
+        )
+
+    return pd.DataFrame(rows).sort_values(["Subfolder", "Image"]).reset_index(drop=True)
+
+
+def _compute_subfolder_averages(out_df, use_weighted_ratio=False, weight_ratio=3.0):
+    """
+    Compute weighted subfolder-level averages from image-level metrics.
+    
+    If use_weighted_ratio=True, superficial images are weighted at weight_ratio (default 3),
+    and central images are weighted at 1.0. Otherwise, all images are weighted equally (1.0).
+    
+    Returns a DataFrame with one row per Subfolder, aggregating numeric columns from the image-level metrics.
+    """
+    if out_df.empty or "Subfolder" not in out_df.columns:
+        return pd.DataFrame()
+    
+    # Identify numeric columns (excluding Subfolder, Image, Image Location)
+    exclude_cols = {"Subfolder", "Image", "Image Location"}
+    numeric_cols = [
+        col for col in out_df.columns 
+        if col not in exclude_cols and pd.api.types.is_numeric_dtype(out_df[col])
+    ]
+    
+    rows = []
+    for subfolder, grp in out_df.groupby("Subfolder", sort=False):
+        out_row = {"Subfolder": subfolder}
+        
+        # Determine weights for each image
+        if use_weighted_ratio and "Image Location" in out_df.columns:
+            weights = []
+            for location in grp["Image Location"]:
+                if "superficial" in str(location).lower():
+                    weights.append(float(weight_ratio))
+                else:
+                    weights.append(1.0)
+            weights = np.array(weights)
+        else:
+            # Equal weighting
+            weights = np.ones(len(grp))
+        
+        # Compute weighted means for numeric columns
+        for col in numeric_cols:
+            col_data = grp[col].values
+            valid_mask = np.isfinite(col_data)
+            
+            if np.any(valid_mask):
+                valid_data = col_data[valid_mask]
+                valid_weights = weights[valid_mask]
+                weighted_mean = np.average(valid_data, weights=valid_weights)
+                out_row[col] = weighted_mean
+            else:
+                out_row[col] = np.nan
+        
+        rows.append(out_row)
+    
+    avg_df = pd.DataFrame(rows)
+    return avg_df.sort_values("Subfolder").reset_index(drop=True)
+
+
 def compute_imf_stereology_metrics(input_csv_path, output_xlsx_path,
                                    pixel_size_nm, thickness_um,
                                    imf_aa_slope, imf_aa_intercept,
-                                   intra_aa_slope, intra_aa_intercept):
+                                   intra_aa_slope, intra_aa_intercept,
+                                   include_image_location=False,
+                                   include_subfolder_avg=False,
+                                   use_weighted_ratio=False,
+                                   weight_ratio=3.0,
+                                   diameter_method="feret",
+                                   subfolder_calc_mode="average_metrics"):
     df = pd.read_csv(input_csv_path)
     required_cols = {
         "Subfolder",
@@ -1358,11 +1655,14 @@ def compute_imf_stereology_metrics(input_csv_path, output_xlsx_path,
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
     numeric_cols = ["Area", "Glycogen Area", "Mean Feret Diameter", "Z-disc max feret"]
+    if "Mean Particle Area" in df.columns:
+        numeric_cols.append("Mean Particle Area")
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["_region"] = df["Region"].map(_normalize_imf_region_name)
     wanted_regions = ["intermyofibrillar", "mitochondria", "zdisc", "intra"]
+    image_location_map = _build_image_location_map(df) if include_image_location else {}
 
     rows = []
     for (subfolder, image), grp in df.groupby(["Subfolder", "Image"], sort=True):
@@ -1376,59 +1676,21 @@ def compute_imf_stereology_metrics(input_csv_path, output_xlsx_path,
             sum(float(region_map[r]["Area"]) for r in wanted_regions if r in region_map)
         )
 
-        out_row = {
-            "Subfolder": subfolder,
-            "Image": image,
-            "sum_area_imf_mito_zdisc_intra": total_area,
-        }
-
-        if "intermyofibrillar" in region_map:
-            imf = _compute_imf_region_set(
-                glycogen_area=float(region_map["intermyofibrillar"]["Glycogen Area"]),
-                mean_feret_diameter=float(region_map["intermyofibrillar"]["Mean Feret Diameter"]),
-                total_area=total_area,
-                thickness_um=float(thickness_um),
-                aa_slope=float(imf_aa_slope),
-                aa_intercept=float(imf_aa_intercept),
-                pixel_size_nm=float(pixel_size_nm),
-            )
-            out_row.update({f"IMF_{k}": v for k, v in imf.items()})
-        else:
-            out_row.update({f"IMF_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
-
-        if "intra" in region_map:
-            intra = _compute_imf_region_set(
-                glycogen_area=float(region_map["intra"]["Glycogen Area"]),
-                mean_feret_diameter=float(region_map["intra"]["Mean Feret Diameter"]),
-                total_area=total_area,
-                thickness_um=float(thickness_um),
-                aa_slope=float(intra_aa_slope),
-                aa_intercept=float(intra_aa_intercept),
-                pixel_size_nm=float(pixel_size_nm),
-            )
-            out_row.update({f"intra_{k}": v for k, v in intra.items()})
-        else:
-            out_row.update({f"intra_{k}": np.nan for k in ["aa", "h", "s", "na", "nv", "sv", "ba", "vv_pct", "numerical_density"]})
-
-        intra_area = float(region_map["intra"]["Area"]) if "intra" in region_map else np.nan
-        zdisc_area = float(region_map["zdisc"]["Area"]) if "zdisc" in region_map else np.nan
-        out_row["intra_zdisc_area_per_total_area"] = _safe_div(
-            sum(area for area in [intra_area, zdisc_area] if np.isfinite(area)),
-            total_area,
+        out_row = _build_imf_output_row(
+            subfolder=subfolder,
+            image_value=image,
+            region_map=region_map,
+            total_area=total_area,
+            pixel_size_nm=pixel_size_nm,
+            thickness_um=thickness_um,
+            imf_aa_slope=imf_aa_slope,
+            imf_aa_intercept=imf_aa_intercept,
+            intra_aa_slope=intra_aa_slope,
+            intra_aa_intercept=intra_aa_intercept,
+            include_image_location=include_image_location,
+            image_location=image_location_map.get((subfolder, _canonical_image_value(image)), ""),
+            diameter_method=diameter_method,
         )
-        out_row["intra_vv_pct_per_intra_zdisc_area"] = _safe_div(
-            out_row.get("intra_vv_pct", np.nan),
-            out_row["intra_zdisc_area_per_total_area"],
-        )
-
-        mito_area = float(region_map["mitochondria"]["Area"]) if "mitochondria" in region_map else np.nan
-        out_row["mito_vv_pct"] = 100.0 * _safe_div(mito_area, total_area)
-
-        if "zdisc" in region_map:
-            zdisc_max_feret = float(region_map["zdisc"]["Z-disc max feret"])
-            out_row["zdiscwidth"] = _safe_div(zdisc_area, zdisc_max_feret) * float(pixel_size_nm)
-        else:
-            out_row["zdiscwidth"] = np.nan
 
         rows.append(out_row)
 
@@ -1444,11 +1706,59 @@ def compute_imf_stereology_metrics(input_csv_path, output_xlsx_path,
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    options_rows = [
+        ("Input CSV Path", os.path.abspath(input_csv_path)),
+        ("Output Workbook Path", os.path.abspath(output_path)),
+        ("Pixel Size (nm)", float(pixel_size_nm)),
+        ("Section Thickness (um)", float(thickness_um)),
+        ("IMF AA Correction Slope", float(imf_aa_slope)),
+        ("IMF AA Correction Intercept", float(imf_aa_intercept)),
+        ("Intra AA Correction Slope", float(intra_aa_slope)),
+        ("Intra AA Correction Intercept", float(intra_aa_intercept)),
+        ("Diameter Method", str(diameter_method)),
+        ("Include Image Location", bool(include_image_location)),
+        ("Include Subfolder Averages", bool(include_subfolder_avg)),
+        ("Subfolder Calculation Mode", str(subfolder_calc_mode)),
+        ("Use Weighted Ratio (3:1 superficial:central)", bool(use_weighted_ratio)),
+        ("Superficial Weight Ratio", float(weight_ratio)),
+        ("Generated At", datetime.now().isoformat(timespec="seconds")),
+    ]
+    options_df = pd.DataFrame(options_rows, columns=["Option", "Value"])
+
+    def _write_imf_workbook(path_to_write):
+        with pd.ExcelWriter(path_to_write, engine='openpyxl') as writer:
+            out_df.to_excel(writer, sheet_name='Image-level', index=False)
+
+            if include_subfolder_avg:
+                if subfolder_calc_mode == "average_inputs":
+                    avg_df = _compute_subfolder_outputs_from_raw_inputs(
+                        raw_df=df,
+                        pixel_size_nm=pixel_size_nm,
+                        thickness_um=thickness_um,
+                        imf_aa_slope=imf_aa_slope,
+                        imf_aa_intercept=imf_aa_intercept,
+                        intra_aa_slope=intra_aa_slope,
+                        intra_aa_intercept=intra_aa_intercept,
+                        include_image_location=include_image_location,
+                        use_weighted_ratio=use_weighted_ratio,
+                        weight_ratio=weight_ratio,
+                        diameter_method=diameter_method,
+                    )
+                else:
+                    avg_df = _compute_subfolder_averages(
+                        out_df,
+                        use_weighted_ratio=use_weighted_ratio,
+                        weight_ratio=weight_ratio
+                    )
+                avg_df.to_excel(writer, sheet_name='Subfolder-avg', index=False)
+
+            options_df.to_excel(writer, sheet_name='Options', index=False)
+
     try:
-        out_df.to_excel(output_path, index=False)
+        _write_imf_workbook(output_path)
     except PermissionError:
         alt_output_path = os.path.splitext(output_path)[0] + "_v2.xlsx"
-        out_df.to_excel(alt_output_path, index=False)
+        _write_imf_workbook(alt_output_path)
         output_path = alt_output_path
 
     return out_df, output_path
@@ -2538,7 +2848,9 @@ def main():
     def run_imf_metrics(csv_file, csv_path_text, output_xlsx_path,
                         pixel_size_nm, thickness_um,
                         imf_aa_slope, imf_aa_intercept,
-                        intra_aa_slope, intra_aa_intercept):
+                        intra_aa_slope, intra_aa_intercept,
+                        include_image_location, include_subfolder_avg,
+                        use_weighted_ratio, diameter_method, subfolder_calc_mode):
         input_csv_path = resolve_uploaded_or_text_path(csv_file, csv_path_text)
         if not input_csv_path:
             raise gr.Error("Select a batch CSV file or provide its path.")
@@ -2554,13 +2866,25 @@ def main():
             imf_aa_intercept=float(imf_aa_intercept),
             intra_aa_slope=float(intra_aa_slope),
             intra_aa_intercept=float(intra_aa_intercept),
+            include_image_location=bool(include_image_location),
+            include_subfolder_avg=bool(include_subfolder_avg),
+            use_weighted_ratio=bool(use_weighted_ratio),
+            weight_ratio=3.0,
+            diameter_method=str(diameter_method),
+            subfolder_calc_mode=str(subfolder_calc_mode),
         )
 
         status = (
             f"Loaded CSV: {input_csv_path}\n"
             f"Rows computed: {len(metrics_df)}\n"
-            f"Saved workbook: {saved_path}"
+            f"Saved workbook: {saved_path}\n"
+            f"Image location added: {bool(include_image_location)}\n"
+            f"Subfolder averaging: {bool(include_subfolder_avg)}\n"
+            f"Diameter method: {diameter_method}\n"
+            f"Subfolder calculation mode: {subfolder_calc_mode}"
         )
+        if include_subfolder_avg:
+            status += f"\nWeighted ratio (3:1 superficial:central): {bool(use_weighted_ratio)}"
         return metrics_df, status, saved_path
 
     # Create the GUI
@@ -2679,6 +3003,35 @@ def main():
                         placeholder="If blank, saves next to the CSV as *_stereology.xlsx"
                     )
 
+                    include_image_location_imf = gr.Checkbox(
+                        label="Add Image Location (central/superficial from Image ranking)",
+                        value=False
+                    )
+
+                    include_subfolder_avg_imf = gr.Checkbox(
+                        label="Include Subfolder-level Averages (requires Image Location)",
+                        value=False
+                    )
+
+                    use_weighted_ratio_imf = gr.Checkbox(
+                        label="Use 3:1 Weighting (superficial:central)",
+                        value=False
+                    )
+
+                    subfolder_calc_mode_imf = gr.Dropdown(
+                        choices=["average_metrics", "average_inputs"],
+                        value="average_metrics",
+                        label="Subfolder Calculation Mode",
+                        info="average_metrics: average image-level metrics | average_inputs: average raw inputs then compute metrics"
+                    )
+
+                    diameter_method_imf = gr.Dropdown(
+                        choices=["feret", "area_circle"],
+                        value="feret",
+                        label="Particle Diameter Calculation Method",
+                        info="feret: from Mean Feret Diameter | area_circle: from Area assuming circular profile"
+                    )
+
                     with gr.Row():
                         pixel_size_nm_imf = gr.Number(
                             label="Pixel Size (nm)",
@@ -2742,6 +3095,11 @@ def main():
                             imf_aa_intercept,
                             intra_aa_slope,
                             intra_aa_intercept,
+                            include_image_location_imf,
+                            include_subfolder_avg_imf,
+                            use_weighted_ratio_imf,
+                            diameter_method_imf,
+                            subfolder_calc_mode_imf,
                         ],
                         outputs=[imf_metrics_output, imf_metrics_status, output_xlsx_path]
                     )
