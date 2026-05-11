@@ -1,6 +1,7 @@
 import os
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
+import cv2
 import torch
 import random
 import numpy as np
@@ -72,6 +73,7 @@ class ImagePatchBuffer:
         label_dir: str,
         segment_names: List[str],
         patch_size: int = 1024,
+        scale_factor: float = 1.0,
         ignore_label: int = -1
     ):
         """
@@ -80,20 +82,58 @@ class ImagePatchBuffer:
             label_dir (str): Directory containing label files (.nrrd).
             segment_names (List[str]): Names of segments to extract from labels.
             patch_size (int): Size of square patches to extract.
+            scale_factor (float): Optional resize factor applied to images and labels before patch extraction.
             ignore_label (int): Value to use for unlabeled regions.
         """
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.patch_size = patch_size
+        self.scale_factor = float(scale_factor)
+        if not np.isfinite(self.scale_factor) or self.scale_factor <= 0:
+            self.scale_factor = 1.0
         self.segment_names = segment_names
-        self.image_files = sorted([f for f in os.listdir(image_dir) if f.lower().endswith('.tif')])
-        self.label_files = sorted([f for f in os.listdir(label_dir) if f.endswith('.nrrd')])
+
+        def _normalize_stem(file_name: str) -> str:
+            stem, _ = os.path.splitext(file_name)
+            if stem.lower().endswith('.seg'):
+                stem = stem[:-4]
+            return stem.lower()
+
+        def _collect_by_stem(directory: str, extensions: Tuple[str, ...]) -> Dict[str, str]:
+            mapping: Dict[str, str] = {}
+            for file_name in sorted(os.listdir(directory)):
+                if not file_name.lower().endswith(extensions):
+                    continue
+                stem = _normalize_stem(file_name)
+                if stem in mapping:
+                    raise ValueError(
+                        f"Duplicate files with same base name in {directory}: "
+                        f"'{mapping[stem]}' and '{file_name}'"
+                    )
+                mapping[stem] = file_name
+            return mapping
+
+        image_by_stem = _collect_by_stem(image_dir, ('.tif', '.tiff'))
+        label_by_stem = _collect_by_stem(label_dir, ('.nrrd',))
+
+        image_stems = set(image_by_stem.keys())
+        label_stems = set(label_by_stem.keys())
+        image_only = sorted(image_stems - label_stems)
+        label_only = sorted(label_stems - image_stems)
+
+        if image_only or label_only:
+            mismatch_lines = ["Mismatch between image and label files"]
+            if image_only:
+                mismatch_lines.append("Images with no matching label: " + ", ".join(image_only))
+            if label_only:
+                mismatch_lines.append("Labels with no matching image: " + ", ".join(label_only))
+            raise AssertionError("\n".join(mismatch_lines))
+
+        ordered_stems = sorted(image_stems)
+        self.image_files = [image_by_stem[s] for s in ordered_stems]
+        self.label_files = [label_by_stem[s] for s in ordered_stems]
         self.num_patches = (2048 / patch_size) * (2048 / patch_size)
         self.ignore_label = ignore_label
-
-        # Ensure image and label files match by name (before extension)
-        for img, lbl in zip(self.image_files, self.label_files):
-            assert img.split('.')[0] == lbl.split('.')[0], "Mismatch between image and label files"
 
         assert len(self.image_files) == len(self.label_files), "Mismatch between number of images and labels"
 
@@ -111,6 +151,22 @@ class ImagePatchBuffer:
 
             # Mark unlabeled regions with ignore_label
             unlabeled = np.sum(label, axis=0) == 0
+
+            if not np.isclose(self.scale_factor, 1.0, rtol=1e-6):
+                src_h, src_w = image.shape[:2]
+                dst_h = max(1, int(round(src_h * self.scale_factor)))
+                dst_w = max(1, int(round(src_w * self.scale_factor)))
+
+                image = cv2.resize(image, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
+
+                label = np.stack([
+                    cv2.resize(label[c].astype(np.uint8), (dst_w, dst_h), interpolation=cv2.INTER_NEAREST)
+                    for c in range(label.shape[0])
+                ], axis=0).astype(np.int8)
+                label = (label > 0).astype(np.int8)
+
+                unlabeled = cv2.resize(unlabeled.astype(np.uint8), (dst_w, dst_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
             label[:, unlabeled] = self.ignore_label
 
             # Normalize image to [0, 1]
@@ -141,6 +197,24 @@ class ImagePatchBuffer:
             for j in range(0, image.shape[1], self.patch_size):
                 img_patch = image[i:i + self.patch_size, j:j + self.patch_size]
                 lbl_patch = label[:, i:i + self.patch_size, j:j + self.patch_size]
+
+                # Pad edge patches so every sample has identical spatial size.
+                pad_h = self.patch_size - img_patch.shape[0]
+                pad_w = self.patch_size - img_patch.shape[1]
+                if pad_h > 0 or pad_w > 0:
+                    img_patch = np.pad(
+                        img_patch,
+                        ((0, max(0, pad_h)), (0, max(0, pad_w))),
+                        mode='constant',
+                        constant_values=0
+                    )
+                    lbl_patch = np.pad(
+                        lbl_patch,
+                        ((0, 0), (0, max(0, pad_h)), (0, max(0, pad_w))),
+                        mode='constant',
+                        constant_values=self.ignore_label
+                    )
+
                 image_patches.append(img_patch)
                 label_patches.append(lbl_patch)
 
